@@ -1,0 +1,34 @@
+{
+    "python.linting.pylintEnabled": true,
+    "python.linting.enabled": true,
+    "python.linting.pycodestyleEnabled": false,
+    "multiCommand.commands": [
+        {
+            "command": "multiCommand.saveFileAndFormatWhenPython",
+            "sequence": [
+                "editor.action.format",
+                "python.sortImports",
+                // { "command": "workbench.action.tasks.runTask", "args": "docformatter: current file" },
+                "workbench.action.files.save"
+            ]
+        }
+    ],
+    "python.sortImports.args": [
+        "--settings-path",
+        "${workspaceFolder}",
+    ],
+    "files.trimTrailingWhitespace": true,
+    "files.trimFinalNewlines": true,
+    "python.linting.pylintArgs": [
+        "--rcfile=${workspaceFolder}/pyproject.toml"
+    ],
+    "python.formatting.provider": "black",
+    "python.formatting.blackArgs": [
+        "--experimental-string-processing"
+    ],
+    "python.linting.mypyEnabled": true,
+    "python.linting.mypyArgs": [
+        "--config-file=${workspaceFolder}/pyproject.toml"
+    ],
+    "python.linting.pylintCategorySeverity.refactor": "Warning"
+}

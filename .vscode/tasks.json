@@ -1,0 +1,10 @@
+{
+    "version": "2.0.0",
+    "tasks": [
+        {
+            "label": "docformatter: current file",
+            "type": "shell",
+            "command": "poetry run docformatter --in-place ${file} --wrap-summaries 100 --wrap-descriptions 100 --pre-summary-newline",
+        }
+    ]
+}
