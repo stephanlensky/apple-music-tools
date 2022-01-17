@@ -37,6 +37,5 @@ def parse_capture(
             for addon in m.addons:  # type: ignore
                 addon.response(f)
 
-    for m in addon_modules:
-        for addon in m.addons:  # type: ignore
-            addon.finalize()
+    for d in filter_requests.get_completed():
+        print(d)

@@ -1,4 +1,5 @@
 import xml.etree.ElementTree as ET
+from datetime import datetime
 from pathlib import PurePosixPath
 from typing import Optional
 from urllib.parse import urlparse, urlunparse
@@ -18,12 +19,19 @@ class PlaybackDispatchFormatException(Exception):
     """
 
 
-class SongDownloadFlow(BaseModel):
-    id: int  # arbitrary, not from Apple. used internally
-    playback_dispatch: str
+class AppleMusicKey(BaseModel):
+    uri: str
+    issued: datetime
+    expiration: datetime
+    ckc: str
+
+
+class AppleMusicDownload(BaseModel):
+    playback_dispatch: Optional[str]
     hls_playlist: Optional[str]
+    selected_hls_stream_info_url: Optional[str]
     selected_hls_stream_info: Optional[str]
-    keys: dict[str, str] = {}  # keyUri -> ckc
+    keys: dict[str, AppleMusicKey] = {}  # keyUri -> key
 
     @validator("playback_dispatch")
     @classmethod
@@ -35,6 +43,7 @@ class SongDownloadFlow(BaseModel):
     @property
     def hls_playlist_url(self) -> str:
         """Parse the HLS playlist URL from the playback dispatch XML."""
+        assert self.playback_dispatch is not None
         return self.__get_hls_playlist_url_from_playback_dispatch(self.playback_dispatch)
 
     @staticmethod
@@ -72,6 +81,7 @@ class SongDownloadFlow(BaseModel):
 
     @property
     def song_title(self) -> str:
+        assert self.playback_dispatch is not None
         root = ET.fromstring(self.playback_dispatch)
         main_dict = root.find("dict")
         assert main_dict is not None
@@ -89,5 +99,29 @@ class SongDownloadFlow(BaseModel):
     def missing_key_uris(self) -> set[str]:
         required_key_uris = self.required_key_uris
         for key_uri in self.keys:
-            required_key_uris.remove(key_uri)
+            if key_uri in required_key_uris:
+                required_key_uris.remove(key_uri)
         return required_key_uris
+
+    def __str__(self) -> str:
+        title = self.song_title if self.playback_dispatch else "(Unknown)"
+        playback_dispatch_status = "Present" if self.playback_dispatch else "None"
+        hls_playlist_url = self.hls_playlist_url if self.playback_dispatch else "None"
+        hls_playlist_status = "Present" if self.hls_playlist else "None"
+        stream_info_status = (
+            f"Present ({self.selected_hls_stream_info_url})"
+            if self.selected_hls_stream_info
+            else "None"
+        )
+        required_keys = "Unknown" if not self.selected_hls_stream_info else self.required_key_uris
+        missing_keys = (
+            "Unknown"
+            if not self.selected_hls_stream_info
+            else (self.missing_key_uris() if self.missing_key_uris() else "")
+        )
+        return (
+            f"{title}:\n\tPlayback dispatch: {playback_dispatch_status}\n\tHLS playlist URL:"
+            f" {hls_playlist_url}\n\tHLS playlist: {hls_playlist_status}\n\tStream info:"
+            f" {stream_info_status}\n\tRequired keys: {required_keys}\n\tMissing keys:"
+            f" {missing_keys}"
+        )

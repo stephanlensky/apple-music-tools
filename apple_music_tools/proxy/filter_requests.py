@@ -1,138 +1,131 @@
-import itertools
+from datetime import datetime
 
 import typer
 from mitmproxy.http import HTTPFlow
+from relational_stream import Flow, RelationalStream
 
-from apple_music_tools.proxy.models import PlaybackDispatchFormatException, SongDownloadFlow
+from apple_music_tools.proxy.models import (
+    AppleMusicDownload,
+    AppleMusicKey,
+    PlaybackDispatchFormatException,
+)
 
 PLAYBACK_DISPATCH_URL = "https://play.itunes.apple.com/WebObjects/MZPlay.woa/wa/subPlaybackDispatch"
 FPS_URL = "https://play.itunes.apple.com/WebObjects/MZPlay.woa/music/fps"
 
 
-class SongDownloadFlowCollector:
-    __id_counter: itertools.count
-    in_progress_sd_flows: dict[int, SongDownloadFlow]  # id -> SongDownloadFlow
-    hls_playlist_urls: dict[str, int]  # expected hls playlist url -> flow id
-    hls_stream_variants: dict[str, int]  # stream variant url -> flow id
-    required_key_uris: dict[str, set[int]]  # key uri -> set[flow id]
-    completed_sd_flows: list[SongDownloadFlow]
-    extra_keys: dict[
-        str, str
-    ]  # sometimes keys may be fetched before a download begins but needed later
-
-    def __init__(self):
-        self.__id_counter = itertools.count()
-        self.in_progress_sd_flows = {}
-        self.hls_playlist_urls = {}
-        self.hls_stream_variants = {}
-        self.required_key_uris = {}
-        self.completed_sd_flows = []
-        self.extra_keys = {}
+class AppleMusicKeyCollectorAddon:
+    keys: dict[str, AppleMusicKey] = {}
 
     def response(self, flow: HTTPFlow):
-        if flow.request.url == PLAYBACK_DISPATCH_URL:
-            typer.echo("Playback dispatch")
-            self.handle_playback_dispatch(flow)
-        elif flow.request.url in self.hls_playlist_urls:
-            typer.echo("HLS playlist fetch")
-            self.handle_hls_playlist(flow)
-        elif flow.request.url in self.hls_stream_variants:
-            typer.echo("HLS stream info fetch")
-            self.handle_hls_stream_info(flow)
-        elif flow.request.url == FPS_URL:
-            typer.echo("Key fetch")
-            self.handle_key_request(flow)
+        if flow.request.url != FPS_URL or flow.response is None or flow.response.status_code != 200:
+            return
 
-    def handle_playback_dispatch(self, flow: HTTPFlow):
+        assert flow.response.text is not None
+
+        uri = flow.request.json()["keyUri"]
+        ckc = flow.response.json()["ckc"]
+        issued = datetime.fromtimestamp(flow.client_conn.timestamp_start)
+        expiration = datetime.fromtimestamp(
+            datetime.timestamp(issued) + flow.response.json()["renew-after"]
+        )
+        self.keys[uri] = AppleMusicKey(uri=uri, ckc=ckc, issued=issued, expiration=expiration)
+
+
+class AppleMusicDownloadAddon(RelationalStream):
+    def __init__(self) -> None:
+        super().__init__([AppleMusicDownloadFlow])
+
+    def response(self, flow: HTTPFlow):
+        self.ingest(flow)
+
+
+class AppleMusicDownloadFlow(Flow[HTTPFlow]):
+    download: AppleMusicDownload
+
+    def __init__(self, events: list[HTTPFlow]):
+        super().__init__(events)
+        self.download = AppleMusicDownload()
+
+    def is_next_event(self, event: HTTPFlow) -> bool:
+        if self.download.playback_dispatch is None:
+            if event.request.url == PLAYBACK_DISPATCH_URL:
+                return self.handle_playback_dispatch(event)
+            else:  # require first event to be a playback dispatch
+                return False
+
+        elif event.request.url == self.download.hls_playlist_url:
+            return self.handle_hls_playlist(event)
+        elif (
+            self.download.hls_playlist is not None
+            and event.request.url in self.download.hls_stream_variants
+        ):
+            return self.handle_hls_stream_info(event)
+        return False
+
+    def is_complete(self) -> bool:
+        return self.download.selected_hls_stream_info is not None
+
+    def handle_playback_dispatch(self, flow: HTTPFlow) -> bool:
         assert flow.response is not None
         if flow.response.status_code != 200:
             typer.echo(f"Skipping playback dispatch with status code {flow.response.status_code}!")
-            return
+            return False
         assert flow.response.text is not None
 
         try:
-            SongDownloadFlow.validate_playback_dispatch(flow.response.text)
+            AppleMusicDownload.validate_playback_dispatch(flow.response.text)
         except PlaybackDispatchFormatException:
             print("Skipping playback dispatch with bad format!")
-            return
+            return False
 
-        sd_flow = SongDownloadFlow(id=next(self.__id_counter), playback_dispatch=flow.response.text)
-        self.in_progress_sd_flows[sd_flow.id] = sd_flow
-        self.hls_playlist_urls[sd_flow.hls_playlist_url] = sd_flow.id
+        self.download = AppleMusicDownload(playback_dispatch=flow.response.text)
+        return True
 
-    def handle_hls_playlist(self, flow: HTTPFlow):
+    def handle_hls_playlist(self, flow: HTTPFlow) -> bool:
         assert flow.response is not None
         if flow.response.status_code != 200:
             typer.echo(f"Skipping hls playlist with status code {flow.response.status_code}!")
-            return
+            return False
         assert flow.response.text is not None
 
-        flow_id = self.hls_playlist_urls.pop(flow.request.url)
-        sd_flow = self.in_progress_sd_flows[flow_id]
-        sd_flow.hls_playlist = flow.response.text
-        self.hls_stream_variants.update({sv: flow_id for sv in sd_flow.hls_stream_variants})
+        self.download.hls_playlist = flow.response.text
+        return True
 
-    def handle_hls_stream_info(self, flow: HTTPFlow):
+    def handle_hls_stream_info(self, flow: HTTPFlow) -> bool:
         assert flow.response is not None
         if flow.response.status_code != 200:
             typer.echo(f"Skipping hls stream info with status code {flow.response.status_code}!")
-            return
+            return False
         assert flow.response.text is not None
 
-        flow_id = self.hls_stream_variants.pop(flow.request.url)
-        # discard unused stream variants
-        for url, id_ in list(self.hls_stream_variants.items()):
-            if id_ == flow_id:
-                del self.hls_stream_variants[url]
-
-        sd_flow = self.in_progress_sd_flows[flow_id]
-        sd_flow.selected_hls_stream_info = flow.response.text
-
-        for key_uri in sd_flow.required_key_uris:
-            if key_uri in self.extra_keys:
-                print(f"Using extra key {key_uri}")
-                sd_flow.keys[key_uri] = self.extra_keys[key_uri]
-                if not sd_flow.missing_key_uris():
-                    self.mark_complete(flow_id)
-                continue
-
-            if key_uri not in self.required_key_uris:
-                self.required_key_uris[key_uri] = set()
-            self.required_key_uris[key_uri].add(flow_id)
-
-    def handle_key_request(self, flow: HTTPFlow):
-        assert flow.response is not None
-        if flow.response.status_code != 200:
-            typer.echo(f"Skipping hls playlist with status code {flow.response.status_code}!")
-            return
-        assert flow.response.text is not None
-
-        key_uri = flow.request.json()["keyUri"]
-        key = flow.response.json()["ckc"]
-
-        if key_uri not in self.required_key_uris:
-            print(f"Storing unneeded key {key_uri}...")
-            self.extra_keys[key_uri] = key
-            return
-
-        for flow_id in self.required_key_uris[key_uri]:
-            sd_flow = self.in_progress_sd_flows[flow_id]
-            sd_flow.keys[key_uri] = key
-
-            if not sd_flow.missing_key_uris():
-                self.mark_complete(flow_id)
-
-        del self.required_key_uris[key_uri]
-
-    def mark_complete(self, flow_id):
-        print("Completed flow!")
-        sd_flow = self.in_progress_sd_flows[flow_id]
-        del self.in_progress_sd_flows[flow_id]
-        self.completed_sd_flows.append(sd_flow)
-
-    def finalize(self):
-        print(f"In progress: {[sd.song_title for sd in self.in_progress_sd_flows.values()]}")
-        print(f"Completed: {[sd.song_title for sd in self.completed_sd_flows]}")
+        self.download.selected_hls_stream_info_url = flow.request.url
+        self.download.selected_hls_stream_info = flow.response.text
+        return True
 
 
-addons = [SongDownloadFlowCollector()]
+apple_music_download_addon = AppleMusicDownloadAddon()
+apple_music_key_collector_addon = AppleMusicKeyCollectorAddon()
+addons = [apple_music_download_addon, apple_music_key_collector_addon]
+
+
+def __dedup_downloads(downloads: list[AppleMusicDownload]):
+    dedup_downloads = []
+    download_streams = set()
+    for d in downloads:
+        if d.selected_hls_stream_info_url not in download_streams:
+            dedup_downloads.append(d)
+            download_streams.add(d.selected_hls_stream_info_url)
+    return dedup_downloads
+
+
+def get_completed() -> list[AppleMusicDownload]:
+    downloads = __dedup_downloads(
+        [f.download for f in apple_music_download_addon.completed_flows(AppleMusicDownloadFlow)]
+    )
+    keys = apple_music_key_collector_addon.keys
+
+    for d in downloads:
+        d.keys = keys
+
+    return downloads
