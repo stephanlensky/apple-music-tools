@@ -23,7 +23,7 @@ ignore_missing_imports = true
 name = "apple-music-tools"
 version = "0.1.0"
 description = "A collection of tools for reverse engineering and understanding the DRM of Apple Music. For educational use only."
-authors = ["Stephan Lensky <stephanl.public@gmail.com>"]
+authors = ["Stephan Lensky <public@slensky.com>"]
 license = "GPL-3.0-only"
 
 [tool.poetry.scripts]
